@@ -19,6 +19,7 @@ protocol PlayerItemTrackProtocol: CapacityProtocol, AnyObject {
     func putPacket(packet: Packet)
 //    func getOutputRender<Frame: ObjectQueueItem>(where predicate: ((Frame) -> Bool)?) -> Frame?
     func shutdown()
+    func waitUntilDecodeFinished()
 }
 
 class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomStringConvertible {
@@ -108,6 +109,9 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
         state = .closed
         outputRenderQueue.shutdown()
     }
+
+    /// [NewTV3] 同步轨在 read 线程内联解码、没有独立解码线程，等待为空操作。
+    func waitUntilDecodeFinished() {}
 
     private var lastPacketBytes = Int32(0)
     private var lastPacketSeconds = Double(-1)
@@ -273,8 +277,23 @@ final class AsyncPlayerItemTrack<Frame: MEFrame>: SyncPlayerItemTrack<Frame> {
         if state == .idle {
             return
         }
+        // [NewTV3] 让 decodeThread 外层 while(!isCancelled) 立刻退出；
+        // state=.closed + packetQueue.shutdown() 也会唤醒阻塞中的 pop，双保险。
+        decodeOperation?.cancel()
         super.shutdown()
         packetQueue.shutdown()
+    }
+
+    // [NewTV3] 阻塞等解码线程真正结束，供 MEPlayerItem.close 在
+    // avformat_close_input 之前调用（修复拆流上下文释放后使用 UAF）。
+    // decode() 还没调用过（opening 阶段即被关闭）时 decodeOperation 为 nil；
+    // 2s 兜底防止个别解码器卡死时把 close 线程永久拖住。
+    override func waitUntilDecodeFinished() {
+        guard let decodeOperation else { return }
+        let deadline = Date(timeIntervalSinceNow: 2)
+        while !decodeOperation.isFinished, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
     }
 }
 

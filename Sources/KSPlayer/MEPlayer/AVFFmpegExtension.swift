@@ -9,7 +9,11 @@ func toDictionary(_ native: OpaquePointer?) -> [String: String] {
     if let native {
         var prev: UnsafeMutablePointer<AVDictionaryEntry>?
         while let tag = av_dict_get(native, "", prev, AV_DICT_IGNORE_SUFFIX) {
-            dict[String(cString: tag.pointee.key)] = String(cString: tag.pointee.value)
+            // [NewTV2] 野流的 metadata entry 的 key/value 可能是 NULL，
+            // String(cString: NULL) 直接 EXC_BAD_ACCESS，逐项校验后再入字典。
+            if let key = tag.pointee.key, let value = tag.pointee.value {
+                dict[String(cString: key)] = String(cString: value)
+            }
             prev = tag
         }
     }

@@ -670,6 +670,12 @@ extension MEPlayerItem: MediaPlayback {
         let closeOperation = BlockOperation {
             Thread.current.name = (self.operationQueue.name ?? "") + "_close"
             self.allPlayerItemTracks.forEach { $0.shutdown() }
+            // [NewTV3] shutdown() 只发状态信号，解码线程可能还在最后一帧的
+            // avcodec/VideoToolbox 调用中；必须 join 等它们退出后才能释放 formatCtx，
+            // 否则旧线程仍在访问已 free 的 codecpar/side data，新台 open_input 复用
+            // 同一 malloc 块后字段被踩成野值（Runner-2026-10-11-154210.ips：
+            // av_display_rotation_get 读到 0x7c8 直接 SIGSEGV）。
+            self.allPlayerItemTracks.forEach { $0.waitUntilDecodeFinished() }
             KSLog("清空formatCtx")
             // 自定义的协议才会av_class为空
             if let formatCtx = self.formatCtx, (formatCtx.pointee.flags & AVFMT_FLAG_CUSTOM_IO) != 0, let opaque = formatCtx.pointee.pb.pointee.opaque {
