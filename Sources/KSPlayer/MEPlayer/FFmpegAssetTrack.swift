@@ -205,21 +205,38 @@ public class FFmpegAssetTrack: MediaPlayerTrack {
             mediaType = .video
             if codecpar.nb_coded_side_data > 0, let sideDatas = codecpar.coded_side_data {
                 // [NewTV] 真实流 side data 条目个位数；count 被拆流中途污染成
-                // 天文数字时，照它遍历会沿数组越界扫整个堆。钳到 64 保底。
-                let sideCount = min(Int(codecpar.nb_coded_side_data), 64)
+                // 天文数字时，照它遍历会沿数组越界扫整个堆。钳到 8 保底。
+                let sideCount = min(Int(codecpar.nb_coded_side_data), 8)
                 for i in 0 ..< sideCount {
                     let sideData = sideDatas[Int(i)]
-                    // [NewTV] 直播流（DVB/MPEG-TS）的 side data 可能是 NULL 指针或
-                    // 长度不足，withMemoryRebound 裸读直接 EXC_BAD_ACCESS（PAC failure，
-                    // Runner-2026-10-11-120910.ips 的闪退点）。逐项校验后再碰。
-                    guard let sdData = sideData.data, sideData.size > 0 else { continue }
+                    // [NewTV] 直播流（DVB/MPEG-TS）的 side data 可能是 NULL 指针、
+                    // 长度不足，或**整条 entry 就是越界读出来的垃圾**（count 被污染时）：
+                    // 这时 data 是任意非 NULL 值、size 是任意数，`data != nil && size > 0`
+                    // 这种字段校验根本挡不住 —— 校验通过、真去读的那一刻内存已被释放/改写
+                    // （PAC failure，Runner-2026-10-11-120910 / 185142 的闪退点）。
+                    // [NewTV4] 两道新闸：
+                    //   ① 尺寸必须**精确**等于该类型规定值（真实流就是精确值，
+                    //      垃圾 entry 极难恰好命中）；
+                    //   ② 解析前先把那段字节**复制到自己的内存**再读，绝不直接
+                    //      解引用 codecpar 里那个可能已失效的指针。
                     if sideData.type == AV_PKT_DATA_DOVI_CONF {
-                        guard sideData.size >= MemoryLayout<DOVIDecoderConfigurationRecord>.size else { continue }
-                        dovi = sdData.withMemoryRebound(to: DOVIDecoderConfigurationRecord.self, capacity: 1) { $0 }.pointee
+                        let expect = MemoryLayout<DOVIDecoderConfigurationRecord>.size
+                        guard let sdData = sideData.data, sideData.size == expect else { continue }
+                        var rec = DOVIDecoderConfigurationRecord()
+                        withUnsafeMutableBytes(of: &rec) { dst in
+                            guard let out = dst.bindMemory(to: UInt8.self).baseAddress else { return }
+                            for k in 0 ..< expect { out[k] = sdData[k] }
+                        }
+                        dovi = rec
                     } else if sideData.type == AV_PKT_DATA_DISPLAYMATRIX {
-                        // av_display_rotation_get 固定读 9 个 Int32
-                        guard sideData.size >= MemoryLayout<Int32>.size * 9 else { continue }
-                        let matrix = sdData.withMemoryRebound(to: Int32.self, capacity: 1) { $0 }
+                        // av_display_rotation_get 固定读 9 个 Int32 = 36 字节
+                        let expect = MemoryLayout<Int32>.size * 9
+                        guard let sdData = sideData.data, sideData.size == expect else { continue }
+                        var matrix = [Int32](repeating: 0, count: 9)
+                        matrix.withUnsafeMutableBytes { dst in
+                            guard let out = dst.bindMemory(to: UInt8.self).baseAddress else { return }
+                            for k in 0 ..< expect { out[k] = sdData[k] }
+                        }
                         let rawRotation = -av_display_rotation_get(matrix)
                         if rawRotation.isFinite {
                             let degrees = Int(rawRotation.rounded())
